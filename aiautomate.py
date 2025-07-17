@@ -46,7 +46,7 @@ class AgentAI:
                 'Extra Trees Classifier': ExtraTreesClassifier(random_state=42),
                 'Gradient Boosting Classifier': GradientBoostingClassifier(random_state=42),
                 'XGBoost Classifier': xgb.XGBClassifier(use_label_encoder=False, eval_metric='logloss', random_state=42), # Suppress warning, set eval_metric
-                'KNN Classifier': KNeighborsClassifier(),
+                'KNN Classifier': KNeighborsClassifier(), # Corrected from KNeighborsRegressor
                 'SVC': SVC(max_iter=2000, random_state=42), # Increased max_iter for convergence
                 'Gaussian Naive Bayes': GaussianNB() # General purpose Naive Bayes
             }
@@ -173,8 +173,101 @@ class AgentAI:
             st.error(f"Error evaluating model: {e}")
             return -np.inf
 
-# Create an instance of the AI agent
-agent = AgentAI()
+# --- Caching the AgentAI instance ---
+@st.cache_resource
+def get_agent_ai():
+    """Caches and returns the AgentAI instance."""
+    return AgentAI()
+
+agent = get_agent_ai()
+
+# --- Caching the ML Pipeline results ---
+@st.cache_data(show_spinner="Running AI Agent Analysis...")
+def run_ml_pipeline_cached(uploaded_file_obj, target_col, task_type):
+    """
+    Encapsulates the entire ML pipeline for caching.
+    Takes uploaded_file_obj (the Streamlit UploadedFile object), target_col, task_type.
+    Returns best_model, best_metric, optimal_test_size, all_results, X_cols, original_categorical_cols.
+    """
+    # --- ADDED CHECK FOR EMPTY FILE ---
+    if uploaded_file_obj.size == 0:
+        st.error("The uploaded CSV file is empty. Please upload a file with data.")
+        return None, None, None, pd.DataFrame(), None, None # Return empty DataFrame for results
+
+    # Read the DataFrame from the uploaded file object inside the cached function
+    try:
+        df_input = pd.read_csv(uploaded_file_obj)
+    except pd.errors.EmptyDataError:
+        st.error("The uploaded CSV file is empty or contains no data columns. Please upload a valid CSV file.")
+        return None, None, None, pd.DataFrame(), None, None
+    except Exception as e:
+        st.error(f"Error reading CSV file: {e}")
+        return None, None, None, pd.DataFrame(), None, None
+
+    df_copy = df_input.copy() # Work on a copy to avoid modifying cached df_input
+
+    # Get the agent instance (already cached globally)
+    agent_instance = get_agent_ai() # Access it here
+
+    # Preprocess data (fit scaler and encoder here)
+    X, y, X_cols, original_categorical_cols = agent_instance._preprocess_data(df_copy, target_col, task_type, fit_scaler_encoder=True)
+
+    if X is None or y is None:
+        return None, None, None, pd.DataFrame(), None, None # Return empty DataFrame for results
+
+    # Define test sizes to iterate for optimal split
+    test_sizes = [0.1, 0.15, 0.2, 0.25, 0.3]
+    overall_best_model = None
+    overall_best_metric = float('-inf')
+    optimal_test_size = None
+    all_results = []
+
+    # Loop through different test sizes
+    for ts in test_sizes:
+        try:
+            # Split data into training and testing sets
+            # Use stratify for classification to maintain class proportions
+            X_train, X_test, y_train, y_test = train_test_split(
+                X, y, test_size=ts, random_state=42,
+                stratify=y if task_type == 'Classification' and y.nunique() > 1 else None
+            )
+
+            # Loop through all models for the selected task
+            for model_name in agent_instance.models[task_type]:
+                # Train model
+                if agent_instance.train_model(X_train, y_train, task_type, model_name):
+                    # Predict
+                    y_pred = agent_instance.predict(X_test, task_type, model_name)
+
+                    # Evaluate
+                    metric = agent_instance.evaluate(y_test, y_pred, task_type)
+                    all_results.append({
+                        'Test Size': ts,
+                        'Model': model_name,
+                        'Metric': metric
+                    })
+
+                    # Update best model if current model performs better
+                    if metric > overall_best_metric:
+                        overall_best_metric = metric
+                        overall_best_model = model_name
+                        optimal_test_size = ts
+                else:
+                    # Log failure if model training fails
+                    all_results.append({
+                        'Test Size': ts,
+                        'Model': model_name,
+                        'Metric': float('-inf') # Indicate failure
+                    })
+        except ValueError as ve:
+            st.warning(f"Skipping test_size {ts} due to data split error (e.g., too few samples for stratification or single class in split): {ve}")
+            continue
+        except Exception as e:
+            st.error(f"An unexpected error occurred during training/evaluation for test_size {ts}: {e}")
+            continue
+
+    return overall_best_model, overall_best_metric, optimal_test_size, pd.DataFrame(all_results), X_cols, original_categorical_cols
+
 
 # Streamlit app configuration
 st.set_page_config(layout="wide", page_title="AI Agent for ML Tasks")
@@ -187,31 +280,79 @@ training various models, and recommending the best performing algorithm.
 You can also get predictions on new data!
 """)
 
-# Initialize chat history in session state
+# Initialize session state variables for chat history and analysis results
 if 'chat_history' not in st.session_state:
     st.session_state.chat_history = []
+if 'analysis_results' not in st.session_state:
+    st.session_state.analysis_results = {
+        'overall_best_model': None,
+        'overall_best_metric': None,
+        'optimal_test_size': None,
+        'all_results_df': pd.DataFrame(),
+        'X_cols': None,
+        'original_categorical_cols': None,
+        'df_loaded_hash': None # To track if a new file is loaded or parameters changed
+    }
+if 'uploaded_file_id' not in st.session_state:
+    st.session_state.uploaded_file_id = None
+if 'target_col_id' not in st.session_state:
+    st.session_state.target_col_id = None
+if 'task_type_id' not in st.session_state:
+    st.session_state.task_type_id = None
+
 
 # Create columns for layout
 left_column, center_column, right_column = st.columns([2, 4, 2])
 
+# Initialize df here for display and initial column selection in the left column
 df = None
-target_column_name = None
-selected_task = None # To store the task selected by the user or detected
-X_cols = None # To store feature columns after preprocessing for consistent prediction input
-original_categorical_cols = [] # To store original categorical columns for manual input preprocessing
+uploaded_file = None # Keep uploaded_file as a local variable for the uploader widget
 
 with left_column:
     st.header("📊 Data & Task Setup")
     uploaded_file = st.file_uploader("📂 Choose a CSV file", type=["csv"])
 
+    current_uploaded_file_id = uploaded_file.file_id if uploaded_file else None
+
+    # Check if a new file is uploaded or if the file has changed
+    if current_uploaded_file_id != st.session_state.uploaded_file_id:
+        st.session_state.uploaded_file_id = current_uploaded_file_id
+        # Clear analysis results if a new file is uploaded
+        if st.session_state.uploaded_file_id is not None:
+            st.session_state.analysis_results = {
+                'overall_best_model': None, 'overall_best_metric': None, 'optimal_test_size': None,
+                'all_results_df': pd.DataFrame(), 'X_cols': None, 'original_categorical_cols': None,
+                'df_loaded_hash': None # Reset hash
+            }
+            st.session_state.chat_history = [] # Clear chat history too
+            st.info("New file uploaded. Please select target and run analysis.")
+            st.rerun() # Rerun to reflect cleared state and allow new selections
+
     if uploaded_file is not None:
         try:
+            # --- IMPORTANT: Added the EmptyDataError catch here for the initial read ---
             df = pd.read_csv(uploaded_file)
             st.success("CSV file loaded successfully!")
             st.dataframe(df.head())
 
             all_columns = df.columns.tolist()
-            target_column_name = st.selectbox("🎯 Select Target Column", all_columns)
+            target_column_name = st.selectbox("🎯 Select Target Column", all_columns, key="target_col_select")
+
+            current_target_col_id = target_column_name # Simple string is hashable
+
+            # Check if target column changed
+            if current_target_col_id != st.session_state.target_col_id:
+                st.session_state.target_col_id = current_target_col_id
+                # Clear analysis results if target column changes
+                st.session_state.analysis_results = {
+                    'overall_best_model': None, 'overall_best_metric': None, 'optimal_test_size': None,
+                    'all_results_df': pd.DataFrame(), 'X_cols': None, 'original_categorical_cols': None,
+                    'df_loaded_hash': None
+                }
+                st.session_state.chat_history = []
+                st.info("Target column changed. Please run analysis.")
+                st.rerun()
+
 
             if target_column_name:
                 # Automatic Task Detection Logic
@@ -222,14 +363,26 @@ with left_column:
                 if y_temp.dtype == 'object' or y_temp.dtype == 'category':
                     detected_task = "Classification"
                 elif pd.api.types.is_numeric_dtype(y_temp):
-                    # If numerical, check ratio of unique values to total values
-                    # and if it's mostly integer-like
-                    if y_temp.nunique() <= 20 and all(y_temp.dropna().apply(lambda x: x == int(x))): # Max 20 unique values for classification guess
+                    if y_temp.nunique() <= 20 and all(y_temp.dropna().apply(lambda x: x == int(x))):
                         detected_task = "Classification"
 
                 st.info(f"Detected Task Type: **{detected_task}**")
-                # User can override the detected task
-                selected_task_override = st.radio("Override Task Type?", ["Auto-Detect", "Regression", "Classification"], index=0)
+                selected_task_override = st.radio("Override Task Type?", ["Auto-Detect", "Regression", "Classification"], index=0, key="task_override_radio")
+
+                current_task_type_id = selected_task_override # Simple string is hashable
+
+                # Check if task type changed
+                if current_task_type_id != st.session_state.task_type_id:
+                    st.session_state.task_type_id = current_task_type_id
+                    # Clear analysis results if task type changes
+                    st.session_state.analysis_results = {
+                        'overall_best_model': None, 'overall_best_metric': None, 'optimal_test_size': None,
+                        'all_results_df': pd.DataFrame(), 'X_cols': None, 'original_categorical_cols': None,
+                        'df_loaded_hash': None
+                    }
+                    st.session_state.chat_history = []
+                    st.info("Task type changed. Please run analysis.")
+                    st.rerun()
 
                 if selected_task_override == "Auto-Detect":
                     selected_task = detected_task
@@ -242,160 +395,123 @@ with left_column:
                 st.write("The agent will automatically find the best `test_size` between 0.1 and 0.3 for optimal model performance.")
                 st.slider("Initial Test Size View (for reference)", min_value=0.1, max_value=0.3, step=0.05, value=0.2, disabled=True)
 
+                # --- Run Analysis Button ---
+                if st.button("🚀 Run Analysis"):
+                    if uploaded_file is not None and target_column_name and selected_task:
+                        # Call the cached ML pipeline function
+                        (
+                            st.session_state.analysis_results['overall_best_model'],
+                            st.session_state.analysis_results['overall_best_metric'],
+                            st.session_state.analysis_results['optimal_test_size'],
+                            st.session_state.analysis_results['all_results_df'],
+                            st.session_state.analysis_results['X_cols'],
+                            st.session_state.analysis_results['original_categorical_cols']
+                        ) = run_ml_pipeline_cached(uploaded_file, target_column_name, selected_task)
+                        st.session_state.analysis_results['df_loaded_hash'] = uploaded_file.file_id # Store hash of current file
+                        st.session_state.chat_history = [] # Clear chat history on new analysis run
+                        st.rerun() # Rerun to display results
+                    else:
+                        st.warning("Please ensure a CSV file is uploaded, target column is selected, and task type is determined before running analysis.")
+
+
+        except pd.errors.EmptyDataError:
+            st.error("The uploaded CSV file is empty or contains no data columns. Please upload a valid CSV file.")
+            df = None # Ensure df is None if file is empty
         except Exception as e:
             st.error(f"Error loading file or selecting target: {e}")
             df = None # Reset df if there's an error
+    else:
+        st.info("Upload a CSV file to begin.")
 
 with center_column:
     st.header("🧠 Agent AI Performance")
-    if df is not None and target_column_name and selected_task:
-        st.write(f"Running models for **{selected_task}** task...")
+    # Retrieve results from session state
+    overall_best_model = st.session_state.analysis_results['overall_best_model']
+    overall_best_metric = st.session_state.analysis_results['overall_best_metric']
+    optimal_test_size = st.session_state.analysis_results['optimal_test_size']
+    all_results_df = st.session_state.analysis_results['all_results_df']
+    # X_cols and original_categorical_cols are also in session_state, but used in prediction section
 
-        # Preprocess data (fit scaler and encoder here)
-        X, y, X_cols, original_categorical_cols = agent._preprocess_data(df, target_column_name, selected_task, fit_scaler_encoder=True)
-
-        if X is not None and y is not None:
-            # Define test sizes to iterate for optimal split
-            test_sizes = [0.1, 0.15, 0.2, 0.25, 0.3]
-            overall_best_model = None
-            overall_best_metric = float('-inf')
-            optimal_test_size = None
-            all_results = []
-
-            # Progress bar and status text for user feedback
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            total_iterations = len(test_sizes) * len(agent.models[selected_task])
-            current_iteration = 0
-
-            # Loop through different test sizes
-            for ts in test_sizes:
-                status_text.text(f"Processing with test_size: {ts*100:.0f}%...")
-                try:
-                    # Split data into training and testing sets
-                    # Use stratify for classification to maintain class proportions
-                    X_train, X_test, y_train, y_test = train_test_split(
-                        X, y, test_size=ts, random_state=42,
-                        stratify=y if selected_task == 'Classification' and y.nunique() > 1 else None
-                    )
-
-                    # Loop through all models for the selected task
-                    for model_name in agent.models[selected_task]:
-                        current_iteration += 1
-                        progress = current_iteration / total_iterations
-                        progress_bar.progress(progress)
-
-                        status_text.text(f"Training {model_name} with test_size={ts*100:.0f}%... ({current_iteration}/{total_iterations})")
-
-                        # Train model
-                        if agent.train_model(X_train, y_train, selected_task, model_name):
-                            # Predict
-                            y_pred = agent.predict(X_test, selected_task, model_name)
-
-                            # Evaluate
-                            metric = agent.evaluate(y_test, y_pred, selected_task)
-                            all_results.append({
-                                'Test Size': ts,
-                                'Model': model_name,
-                                'Metric': metric
-                            })
-
-                            # Update best model if current model performs better
-                            if metric > overall_best_metric:
-                                overall_best_metric = metric
-                                overall_best_model = model_name
-                                optimal_test_size = ts
-                        else:
-                            # Log failure if model training fails
-                            all_results.append({
-                                'Test Size': ts,
-                                'Model': model_name,
-                                'Metric': float('-inf') # Indicate failure
-                            })
-                except ValueError as ve:
-                    st.warning(f"Skipping test_size {ts} due to data split error (e.g., too few samples for stratification or single class in split): {ve}")
-                    continue
-                except Exception as e:
-                    st.error(f"An unexpected error occurred during training/evaluation for test_size {ts}: {e}")
-                    continue
-
-            progress_bar.empty() # Hide progress bar when done
-            status_text.empty() # Clear status text
-
-            st.subheader("🏆 Best Model & Performance")
-            if overall_best_model:
-                st.success(f"**Best Model:** `{overall_best_model}`")
-                st.success(f"**Best Metric ({'R2 Score' if selected_task == 'Regression' else 'Accuracy'}):** `{overall_best_metric:.4f}`")
-                st.success(f"**Optimal Test Size:** `{optimal_test_size*100:.0f}%`")
-                st.markdown(f"The agent recommends using the `{overall_best_model}` model with a `{optimal_test_size*100:.0f}%` test split for your dataset, as it yielded the highest performance.")
-            else:
-                st.warning("Could not find a suitable model. Please check your data and selections.")
-
+    # Display analysis results only if they exist in session state
+    if overall_best_model:
+        st.subheader("🏆 Best Model & Performance")
+        st.success(f"**Best Model:** `{overall_best_model}`")
+        st.success(f"**Best Metric ({'R2 Score' if selected_task == 'Regression' else 'Accuracy'}):** `{overall_best_metric:.4f}`")
+        st.success(f"**Optimal Test Size:** `{optimal_test_size*100:.0f}%`")
+        st.markdown(f"The agent recommends using the `{overall_best_model}` model with a `{optimal_test_size*100:.0f}%` test split for your dataset, as it yielded the highest performance.")
+        if not all_results_df.empty:
             st.subheader("📊 All Model Results")
-            results_df = pd.DataFrame(all_results)
             # Display results, sorting by metric
-            st.dataframe(results_df.sort_values(by='Metric', ascending=False))
-
-            st.subheader("💬 Chat with Agent AI")
-
-            # Display chat history
-            for message in st.session_state.chat_history:
-                st.write(f"**{message['role']}**: {message['content']}")
-
-            # Chat input and logic
-            chat_input = st.text_input("Ask me anything about your analysis (e.g., 'What is the best model?', 'How good is the performance?', 'What about the test size?')", key="chat_input")
-
-            if chat_input:
-                st.session_state.chat_history.append({"role": "You", "content": chat_input})
-                chat_input_lower = chat_input.lower()
-                ai_response = ""
-
-                if "best model" in chat_input_lower:
-                    if overall_best_model:
-                        ai_response = f"The best model for this task is **{overall_best_model}** with a performance metric of **{overall_best_metric:.4f}** achieved with a **{optimal_test_size*100:.0f}%** test split."
-                    else:
-                        ai_response = "I haven't been able to determine the best model yet. Please ensure data is loaded and processed correctly."
-                elif "model performance" in chat_input_lower or "how good" in chat_input_lower:
-                    if overall_best_model:
-                        metric_type = 'R2 Score' if selected_task == 'Regression' else 'Accuracy'
-                        ai_response = (
-                            f"The performance of the **{overall_best_model}** model is **{overall_best_metric:.4f}**.\n"
-                            f"This means the model achieved a {metric_type} of **{overall_best_metric:.4f}**.\n"
-                        )
-                        if selected_task == 'Regression':
-                            ai_response += f"An R2 score of {overall_best_metric*100:.2f}% indicates that this percentage of the variance in the target variable can be explained by the model."
-                        else:
-                            ai_response += f"An accuracy of {overall_best_metric*100:.2f}% means the model correctly classified this percentage of samples."
-
-                        if overall_best_metric >= 0.8:
-                            ai_response += "\nThis is a **very good** performance! Your model is highly accurate/predictive."
-                        elif overall_best_metric >= 0.6:
-                            ai_response += "\nThis is a **good** performance. There might be room for further improvement with more advanced tuning or feature engineering."
-                        else:
-                            ai_response += "\nThe performance is moderate. You might consider more data, different features, or deeper model tuning."
-                    else:
-                        ai_response = "I need to analyze the data first to tell you about model performance."
-                elif "test size" in chat_input_lower or "split" in chat_input_lower:
-                    if optimal_test_size:
-                        ai_response = f"The optimal test size found for your dataset is **{optimal_test_size*100:.0f}%**. This split provided the best balance for evaluating the models and achieving the highest performance."
-                    else:
-                        ai_response = "I'm still determining the optimal test size. Please wait for the analysis to complete."
-                elif "hello" in chat_input_lower or "hi" in chat_input_lower:
-                    ai_response = "Hello there! How can I assist you with your machine learning task today?"
-                else:
-                    ai_response = f"I'm happy to chat with you about data science! You said: '{chat_input}'. Try asking about 'best model', 'model performance', or 'test size'."
-
-                st.session_state.chat_history.append({"role": "Agent AI", "content": ai_response})
-                # Rerun the app to display the new message and clear the input
-                st.rerun()
-        else:
-            st.warning("Please upload a CSV file and select a target column to proceed with analysis.")
+            st.dataframe(all_results_df.sort_values(by='Metric', ascending=False))
+    elif uploaded_file is not None and target_column_name and selected_task:
+        st.info("Analysis not yet run or results cleared. Click 'Run Analysis' to proceed.")
     else:
-        st.info("Upload a CSV file and select a target column to start the analysis.")
+        st.info("Upload a CSV file, select a target column, and click 'Run Analysis' to see performance.")
+
+
+    st.subheader("💬 Chat with Agent AI")
+
+    # Display chat history
+    for message in st.session_state.chat_history:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    # Chat input and logic
+    chat_input = st.text_input("Ask me anything about your analysis (e.g., 'What is the best model?', 'How good is the performance?', 'What about the test size?')", key="chat_input")
+
+    if chat_input:
+        st.session_state.chat_history.append({"role": "user", "content": chat_input})
+        chat_input_lower = chat_input.lower()
+        ai_response = ""
+
+        # Retrieve results from session state for chatbot logic
+        overall_best_model_chat = st.session_state.analysis_results['overall_best_model']
+        overall_best_metric_chat = st.session_state.analysis_results['overall_best_metric']
+        optimal_test_size_chat = st.session_state.analysis_results['optimal_test_size']
+        # selected_task is a global variable from the main script flow, which is fine for chat responses
+
+        # Check if analysis results are available before responding
+        if overall_best_model_chat is None:
+            ai_response = "I need to complete the data analysis first before I can answer questions about models or performance. Please upload your data and click 'Run Analysis'."
+        elif "best model" in chat_input_lower:
+            ai_response = f"The best model for this task is **{overall_best_model_chat}** with a performance metric of **{overall_best_metric_chat:.4f}** achieved with a **{optimal_test_size_chat*100:.0f}%** test split."
+        elif "model performance" in chat_input_lower or "how good" in chat_input_lower:
+            metric_type = 'R2 Score' if selected_task == 'Regression' else 'Accuracy'
+            ai_response = (
+                f"The performance of the **{overall_best_model_chat}** model is **{overall_best_metric_chat:.4f}**.\n"
+                f"This means the model achieved a {metric_type} of **{overall_best_metric_chat:.4f}**.\n"
+            )
+            if selected_task == 'Regression':
+                ai_response += f"An R2 score of {overall_best_metric_chat*100:.2f}% indicates that this percentage of the variance in the target variable can be explained by the model."
+            else:
+                ai_response += f"An accuracy of {overall_best_metric_chat*100:.2f}% means the model correctly classified this percentage of samples."
+
+            if overall_best_metric_chat >= 0.8:
+                ai_response += "\nThis is a **very good** performance! Your model is highly accurate/predictive."
+            elif overall_best_metric_chat >= 0.6:
+                ai_response += "\nThis is a **good** performance. There might be room for further improvement with more advanced tuning or feature engineering."
+            else:
+                ai_response += "\nThe performance is moderate. You might consider more data, different features, or deeper model tuning."
+        elif "test size" in chat_input_lower or "split" in chat_input_lower:
+            ai_response = f"The optimal test size found for your dataset is **{optimal_test_size_chat*100:.0f}%**. This split provided the best balance for evaluating the models and achieving the highest performance."
+        elif "hello" in chat_input_lower or "hi" in chat_input_lower:
+            ai_response = "Hello there! How can I assist you with your machine learning task today?"
+        else:
+            ai_response = f"I'm happy to chat with you about data science! You said: '{chat_input}'. Try asking about 'best model', 'model performance', or 'test size'."
+
+        st.session_state.chat_history.append({"role": "assistant", "content": ai_response}) # Changed role to 'assistant'
+        st.rerun() # Rerun to display the new message and clear the input
+
 
 with right_column:
     st.header("🚀 Make a Prediction")
-    if df is not None and target_column_name and selected_task and overall_best_model:
+    # Retrieve results from session state
+    overall_best_model = st.session_state.analysis_results['overall_best_model']
+    X_cols = st.session_state.analysis_results['X_cols']
+    original_categorical_cols = st.session_state.analysis_results['original_categorical_cols']
+
+    # Only show prediction section if analysis results are available AND df is loaded (for feature names)
+    if df is not None and target_column_name and selected_task and overall_best_model and X_cols is not None and original_categorical_cols is not None:
         st.markdown(f"Using the best model: **`{overall_best_model}`**")
         st.markdown("---")
         st.subheader("Manual Input for Prediction")
@@ -487,4 +603,4 @@ with right_column:
             except Exception as e:
                 st.error(f"Error during manual prediction: {e}")
     else:
-        st.info("Please load data, select a target, and run the analysis first to enable manual prediction.")
+        st.info("Please load data, select a target, and click 'Run Analysis' to enable manual prediction.")
